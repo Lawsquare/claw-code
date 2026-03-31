@@ -19,7 +19,8 @@ use render::{Spinner, TerminalRenderer};
 use runtime::{
     estimate_session_tokens, load_system_prompt, ApiClient, ApiRequest, AssistantEvent,
     CompactionConfig, ContentBlock, ConversationMessage, ConversationRuntime, MessageRole,
-    PermissionMode, PermissionPolicy, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
+    PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
+    PermissionRequest, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
 };
 use tools::{execute_tool, mvp_tool_specs};
 
@@ -347,12 +348,16 @@ fn run_repl(model: String) -> Result<(), Box<dyn std::error::Error>> {
             "/exit" | "/quit" => break,
             "/help" => {
                 println!("Available commands:");
-                println!("  /help    Show help");
-                println!("  /status  Show session status");
-                println!("  /compact Compact session history");
-                println!("  /exit    Quit the REPL");
+                println!("  /help         Show help");
+                println!("  /status       Show session status");
+                println!("  /tools        Show tool catalog and permission policy");
+                println!("  /permissions  Show permission mode details");
+                println!("  /compact      Compact session history");
+                println!("  /exit         Quit the REPL");
             }
             "/status" => cli.print_status(),
+            "/tools" => cli.print_tools(),
+            "/permissions" => cli.print_permissions(),
             "/compact" => cli.compact()?,
             _ => cli.run_turn(trimmed)?,
         }
@@ -366,23 +371,27 @@ struct LiveCli {
     system_prompt: Vec<String>,
     runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
     session_path: PathBuf,
+    permission_policy: PermissionPolicy,
 }
 
 impl LiveCli {
     fn new(model: String, enable_tools: bool) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
         let session_path = new_session_path()?;
+        let permission_policy = permission_policy_from_env();
         let runtime = build_runtime(
             Session::new(),
             model.clone(),
             system_prompt.clone(),
             enable_tools,
+            permission_policy.clone(),
         )?;
         Ok(Self {
             model,
             system_prompt,
             runtime,
             session_path,
+            permission_policy,
         })
     }
 
@@ -394,7 +403,8 @@ impl LiveCli {
             TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
-        let result = self.runtime.run_turn(input, None);
+        let mut permission_prompter = CliPermissionPrompter::new();
+        let result = self.runtime.run_turn(input, Some(&mut permission_prompter));
         match result {
             Ok(turn) => {
                 spinner.finish(
@@ -443,6 +453,37 @@ impl LiveCli {
         }
     }
 
+    fn print_permissions(&self) {
+        let mode = env::var("RUSTY_CLAUDE_PERMISSION_MODE")
+            .unwrap_or_else(|_| "workspace-write".to_string());
+        println!("Permission mode: {mode}");
+        println!(
+            "Default policy: {}",
+            permission_mode_label(self.permission_policy.mode_for("bash"))
+        );
+        println!("Read-only safe tools stay auto-allowed when read-only mode is active.");
+        println!("Interactive approvals appear when permission mode is set to prompt.");
+    }
+
+    fn print_tools(&self) {
+        println!("Tool catalog:");
+        for spec in mvp_tool_specs() {
+            let mode = self.permission_policy.mode_for(spec.name);
+            let summary = summarize_tool_schema(&spec.input_schema);
+            println!(
+                "- {} [{}] — {}{}",
+                spec.name,
+                permission_mode_label(mode),
+                spec.description,
+                if summary.is_empty() {
+                    String::new()
+                } else {
+                    format!(" | args: {summary}")
+                }
+            );
+        }
+    }
+
     fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let estimated_before = self.runtime.estimated_tokens();
         let result = self.runtime.compact(CompactionConfig::default());
@@ -456,6 +497,7 @@ impl LiveCli {
             self.model.clone(),
             self.system_prompt.clone(),
             true,
+            self.permission_policy.clone(),
         )?;
 
         if removed == 0 {
@@ -628,13 +670,14 @@ fn build_runtime(
     model: String,
     system_prompt: Vec<String>,
     enable_tools: bool,
+    permission_policy: PermissionPolicy,
 ) -> Result<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
     Ok(ConversationRuntime::new(
         session,
         AnthropicRuntimeClient::new(model, enable_tools)?,
         CliToolExecutor::new(),
-        permission_policy_from_env(),
+        permission_policy,
         system_prompt,
     ))
 }
@@ -819,6 +862,77 @@ fn response_to_events(
     Ok(events)
 }
 
+fn permission_mode_label(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Allow => "allow",
+        PermissionMode::Deny => "deny",
+        PermissionMode::Prompt => "prompt",
+    }
+}
+
+fn summarize_tool_schema(schema: &serde_json::Value) -> String {
+    let Some(properties) = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return String::new();
+    };
+    let mut keys = properties.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    keys.join(", ")
+}
+
+fn summarize_tool_output(tool_name: &str, output: &str) -> String {
+    let compact = output.replace('\n', " ");
+    let preview = truncate_preview(compact.trim(), 120);
+    if preview.is_empty() {
+        format!("{tool_name} completed with no textual output")
+    } else {
+        format!("{tool_name} → {preview}")
+    }
+}
+
+struct CliPermissionPrompter {
+    prompt: String,
+}
+
+impl CliPermissionPrompter {
+    fn new() -> Self {
+        Self {
+            prompt: "Allow tool? [y]es / [n]o / [a]lways deny this run: ".to_string(),
+        }
+    }
+}
+
+impl PermissionPrompter for CliPermissionPrompter {
+    fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
+        println!(
+            "
+Tool permission request:"
+        );
+        println!("- tool: {}", request.tool_name);
+        println!("- input: {}", truncate_preview(request.input.trim(), 200));
+        print!("{}", self.prompt);
+        let _ = io::stdout().flush();
+
+        let mut response = String::new();
+        match io::stdin().read_line(&mut response) {
+            Ok(_) => match response.trim().to_ascii_lowercase().as_str() {
+                "y" | "yes" => PermissionPromptDecision::Allow,
+                "a" | "always" => PermissionPromptDecision::Deny {
+                    reason: "tool denied for this run by user".to_string(),
+                },
+                _ => PermissionPromptDecision::Deny {
+                    reason: "tool denied by user".to_string(),
+                },
+            },
+            Err(error) => PermissionPromptDecision::Deny {
+                reason: format!("tool approval failed: {error}"),
+            },
+        }
+    }
+}
+
 struct CliToolExecutor {
     renderer: TerminalRenderer,
 }
@@ -837,7 +951,10 @@ impl ToolExecutor for CliToolExecutor {
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
         match execute_tool(tool_name, &value) {
             Ok(output) => {
-                let markdown = format!("### Tool `{tool_name}`\n\n```json\n{output}\n```\n");
+                let summary = summarize_tool_output(tool_name, &output);
+                let markdown = format!(
+                    "### Tool `{tool_name}`\n\n- Summary: {summary}\n\n```json\n{output}\n```\n"
+                );
                 self.renderer
                     .stream_markdown(&markdown, &mut io::stdout())
                     .map_err(|error| ToolError::new(error.to_string()))?;
@@ -853,6 +970,10 @@ fn permission_policy_from_env() -> PermissionPolicy {
         env::var("RUSTY_CLAUDE_PERMISSION_MODE").unwrap_or_else(|_| "workspace-write".to_string());
     match mode.as_str() {
         "read-only" => PermissionPolicy::new(PermissionMode::Deny)
+            .with_tool_mode("read_file", PermissionMode::Allow)
+            .with_tool_mode("glob_search", PermissionMode::Allow)
+            .with_tool_mode("grep_search", PermissionMode::Allow),
+        "prompt" => PermissionPolicy::new(PermissionMode::Prompt)
             .with_tool_mode("read_file", PermissionMode::Allow)
             .with_tool_mode("glob_search", PermissionMode::Allow)
             .with_tool_mode("grep_search", PermissionMode::Allow),
@@ -913,6 +1034,7 @@ fn print_help() {
     println!("  rusty-claude-cli bootstrap-plan");
     println!("  rusty-claude-cli sessions [--query TEXT] [--limit N]");
     println!("  rusty-claude-cli resume <latest|SESSION|PATH> [/compact]");
+    println!("  env RUSTY_CLAUDE_PERMISSION_MODE=prompt enables interactive tool approval");
     println!("  rusty-claude-cli system-prompt [--cwd PATH] [--date YYYY-MM-DD]");
     println!("  rusty-claude-cli --resume SESSION.json [/compact]");
 }
